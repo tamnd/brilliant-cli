@@ -1,0 +1,10 @@
+title       = "brilliant"
+baseURL     = "https://brilliant-cli.tamnd.com/"
+description = "Read public Brilliant.org wiki articles and courses"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/brilliant-cli"
