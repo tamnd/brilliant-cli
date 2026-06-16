@@ -1,173 +1,260 @@
+// Package brilliant provides the kit Domain for brilliant-cli.
 package brilliant
 
 import (
 	"context"
-	"net/url"
+	"errors"
 	"strings"
+	"time"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes brilliant as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/brilliant-cli/brilliant"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// brilliant:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone brilliant binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the brilliant driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the brilliant.org driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames, and binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
-		Scheme: "brilliant",
-		Hosts:  []string{Host},
+		Scheme:  "brilliant",
+		Aliases: []string{"br"},
+		Hosts:   []string{Host},
 		Identity: kit.Identity{
 			Binary: "brilliant",
 			Short:  "Read public Brilliant.org wiki articles and courses",
-			Long: `Read public Brilliant.org wiki articles and courses
+			Long: `brilliant reads public Brilliant.org wiki articles and courses.
 
-brilliant reads public brilliant data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+It fetches the public wiki (math, science, computer science) and course
+metadata from brilliant.org over HTTPS. No API key required; course
+lessons and interactive problems require a Brilliant subscription.
+
+Quick start:
+  brilliant wiki                         list wiki articles (all topics)
+  brilliant wiki --topic algebra         algebra articles
+  brilliant article linear-algebra       full article detail
+  brilliant topics                       list wiki topic categories
+  brilliant courses                      list public courses
+  brilliant course calculus-fundamentals course detail`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/brilliant-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `brilliant page` and
-	// `ant get brilliant://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "wiki",
+		Group:   "articles",
+		Summary: "List wiki articles, optionally filtered by topic",
+		Args:    []kit.Arg{{Name: "topic", Help: "topic slug (algebra, calculus, ...)", Optional: true}},
+	}, listWiki)
 
-	// List op: members of a page, the home of `brilliant links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// brilliant://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "article",
+		Group:   "articles",
+		Summary: "Fetch a wiki article by slug",
+		Single:  true,
+		Args:    []kit.Arg{{Name: "slug", Help: "wiki article slug, e.g. linear-algebra"}},
+	}, getArticle)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "topics",
+		Group:   "articles",
+		Summary: "List wiki topic categories",
+	}, listTopics)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "courses",
+		Group:   "courses",
+		Summary: "List public courses on brilliant.org",
+		Args:    []kit.Arg{{Name: "topic", Help: "filter by topic keyword", Optional: true}},
+	}, listCourses)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "course",
+		Group:   "courses",
+		Summary: "Fetch a course by slug",
+		Single:  true,
+		Args:    []kit.Arg{{Name: "slug", Help: "course slug, e.g. calculus-fundamentals"}},
+	}, getCourse)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
-	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
-	}
+	delay := DefaultDelay
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		delay = cfg.Rate
+	}
+	timeout := 30 * time.Second
+	if cfg.Timeout > 0 {
+		timeout = cfg.Timeout
+	}
+	c := NewClient(delay, timeout)
+	if cfg.UserAgent != "" {
+		c.userAgent = cfg.UserAgent
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
-	}
-	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.retries = cfg.Retries
 	}
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input types ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type wikiIn struct {
+	Topic  string  `kit:"arg" help:"topic slug (algebra, calculus, number-theory, combinatorics, probability, logic, computer-science)"`
+	Limit  int     `kit:"flag,inherit" help:"max articles to return"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type articleIn struct {
+	Slug   string  `kit:"arg" help:"wiki article slug, e.g. linear-algebra"`
+	Client *Client `kit:"inject"`
+}
+
+type topicsIn struct {
+	Client *Client `kit:"inject"`
+}
+
+type coursesIn struct {
+	Topic  string  `kit:"arg" help:"filter by topic keyword"`
+	Limit  int     `kit:"flag,inherit" help:"max courses to return"`
+	Client *Client `kit:"inject"`
+}
+
+type courseIn struct {
+	Slug   string  `kit:"arg" help:"course slug, e.g. calculus-fundamentals"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func listWiki(ctx context.Context, in wikiIn, emit func(*Article) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	return emit(p)
+	topics := DefaultSeedTopics
+	if in.Topic != "" {
+		topics = []string{in.Topic}
+	}
+	seen := map[string]bool{}
+	count := 0
+	for _, topic := range topics {
+		if count >= limit {
+			break
+		}
+		seedURL := WikiBase + topic + "/"
+		links, err := in.Client.FetchWikiLinks(ctx, seedURL)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return mapErr(err)
+		}
+		for _, href := range links {
+			if count >= limit {
+				break
+			}
+			slug := wikiSlugFromHref(href)
+			if slug == "" || seen[slug] {
+				continue
+			}
+			seen[slug] = true
+			a := &Article{
+				Slug:  slug,
+				Title: titleCaseSlug(slug),
+				Topic: topic,
+				URL:   WikiBase + slug + "/",
+			}
+			if err := emit(a); err != nil {
+				return err
+			}
+			count++
+		}
+	}
+	return nil
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func getArticle(ctx context.Context, in articleIn, emit func(*Article) error) error {
+	if in.Slug == "" {
+		return errs.Usage("slug is required")
+	}
+	a, _, err := in.Client.FetchArticle(ctx, in.Slug)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	return emit(a)
+}
+
+func listTopics(ctx context.Context, in topicsIn, emit func(*Topic) error) error {
+	for _, t := range DefaultSeedTopics {
+		topic := &Topic{
+			Topic:        t,
+			SeedURL:      WikiBase + t + "/",
+			ArticleCount: 0,
+		}
+		if err := emit(topic); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full brilliant.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized brilliant reference: %q", input)
+func listCourses(ctx context.Context, in coursesIn, emit func(*Course) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	return "page", id, nil
+	courses, err := in.Client.FetchCourses(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	count := 0
+	for i := range courses {
+		if count >= limit {
+			break
+		}
+		c := &courses[i]
+		if in.Topic != "" && !strings.Contains(strings.ToLower(c.Category), strings.ToLower(in.Topic)) &&
+			!strings.Contains(strings.ToLower(c.Title), strings.ToLower(in.Topic)) &&
+			!strings.Contains(strings.ToLower(c.Slug), strings.ToLower(in.Topic)) {
+			continue
+		}
+		if err := emit(c); err != nil {
+			return err
+		}
+		count++
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("brilliant has no resource type %q", uriType)
+func getCourse(ctx context.Context, in courseIn, emit func(*Course) error) error {
+	if in.Slug == "" {
+		return errs.Usage("slug is required")
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	c, err := in.Client.FetchCourse(ctx, in.Slug)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(c)
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts library errors to kit error kinds with the right exit codes.
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
+	if errors.Is(err, ErrSubscriptionRequired) {
+		return errs.NeedAuth("%s", err.Error())
+	}
 	return err
 }
